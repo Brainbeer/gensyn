@@ -1,0 +1,16 @@
+cat > .gitignore << 'EOF'
+# Binary
+gensyn
+
+# Go build artifacts
+*.o
+*.a
+*.so
+
+# Test artifacts
+*.test
+
+# Go workspace
+go.work
+go.work.sum
+EOF
