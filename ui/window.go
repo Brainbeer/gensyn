@@ -10,6 +10,7 @@ import (
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/widget"
 	"github.com/Brainbeer/gensyn/portage"
@@ -48,6 +49,22 @@ func StartUI() {
 	a := app.New()
 	w := a.NewWindow("gensyn")
 	w.Resize(fyne.NewSize(1920, 1080))
+
+	// --- Menu bar ---
+	fileMenu := fyne.NewMenu("File",
+		fyne.NewMenuItem("Quit", func() { a.Quit() }),
+	)
+	editMenu := fyne.NewMenu("Edit",
+		fyne.NewMenuItem("Preferences", func() {
+			dialog.ShowInformation("Preferences", "Preferences coming soon.", w)
+		}),
+	)
+	aboutMenu := fyne.NewMenu("About",
+		fyne.NewMenuItem("About gensyn", func() {
+			dialog.ShowInformation("About", "gensyn\nA Synaptic-like package manager for Gentoo.", w)
+		}),
+	)
+	w.SetMainMenu(fyne.NewMainMenu(fileMenu, editMenu, aboutMenu))
 
 	categories, err := portage.GetCategories()
 	if err != nil {
@@ -195,18 +212,20 @@ func StartUI() {
 		packageList.Refresh()
 	}
 
-	// Description (center bottom)
-	description := widget.NewLabel("[ Description ]")
+	// Description (center bottom) - scrollable, will show package description when wired up
+	description := widget.NewRichTextFromMarkdown("")
+	descriptionScroll := container.NewScroll(description)
 
-	// Output terminal (right)
-	output := widget.NewLabel("[ Output ]")
+	// Output terminal (right) - scrollable, will stream emerge output when wired up
+	output := widget.NewRichTextFromMarkdown("")
+	outputScroll := container.NewScroll(output)
 
 	// Center section: package list over description
-	centerSection := container.NewVSplit(packageList, description)
+	centerSection := container.NewVSplit(packageList, descriptionScroll)
 	centerSection.SetOffset(0.6)
 
 	// Lower section: center over output terminal
-	lowerSection := container.NewHSplit(centerSection, output)
+	lowerSection := container.NewHSplit(centerSection, outputScroll)
 	lowerSection.SetOffset(0.4)
 
 	// Right section: toolbar on top, lower section below
