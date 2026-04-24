@@ -3,20 +3,51 @@
 package ui
 
 import (
+	"image/color"
 	"strings"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/widget"
 	"github.com/Brainbeer/gensyn/portage"
 )
 
+// compactHBox lays out children horizontally with a 2px gap instead of the default theme padding
+type compactHBox struct{}
+
+func (c *compactHBox) Layout(objects []fyne.CanvasObject, size fyne.Size) {
+	x := float32(0)
+	for _, o := range objects {
+		w := o.MinSize().Width
+		o.Resize(fyne.NewSize(w, size.Height))
+		o.Move(fyne.NewPos(x, 0))
+		x += w + 2
+	}
+}
+
+func (c *compactHBox) MinSize(objects []fyne.CanvasObject) fyne.Size {
+	w := float32(0)
+	h := float32(0)
+	for i, o := range objects {
+		ms := o.MinSize()
+		if i > 0 {
+			w += 2
+		}
+		w += ms.Width
+		if ms.Height > h {
+			h = ms.Height
+		}
+	}
+	return fyne.NewSize(w, h)
+}
+
 func StartUI() {
 	a := app.New()
 	w := a.NewWindow("gensyn")
-	w.Resize(fyne.NewSize(800, 600))
+	w.Resize(fyne.NewSize(1920, 1080))
 
 	categories, err := portage.GetCategories()
 	if err != nil {
@@ -65,8 +96,58 @@ func StartUI() {
 		},
 	)
 
-	// Toolbar (top right)
-	toolbar := widget.NewLabel("[ Toolbar ]")
+	// Toolbar
+	// Keyword search entry fills available width, same height as buttons
+	searchEntry := widget.NewEntry()
+	searchEntry.SetPlaceHolder("Search...")
+
+	// 10px gap between search entry and buttons
+	gap := canvas.NewRectangle(color.Transparent)
+	gap.SetMinSize(fyne.NewSize(10, 1))
+
+	// Sync and Install buttons stacked vertically on the far right (56px = ~7% of 800px)
+	syncButton := widget.NewButton("Sync", func() {})
+	installButton := widget.NewButton("Install", func() {})
+
+	buttonStack := container.New(
+		layout.NewGridWrapLayout(fyne.NewSize(56, 30)),
+		syncButton,
+		installButton,
+	)
+
+	// Toggle for search mode, with "|" separator to distinguish from operation radio buttons
+	searchToggle := widget.NewRadioGroup([]string{"Package", "Command"}, nil)
+	searchToggle.SetSelected("Package")
+	searchToggle.Horizontal = true
+
+	separator := widget.NewLabel("|")
+
+	// Operation radio buttons
+	operationRadio := widget.NewRadioGroup([]string{"No Flag", "-p (pretend)", "-f (fetch)", "-uvNDU (Update)", "Custom"}, nil)
+	operationRadio.SetSelected("No Flag")
+	operationRadio.Horizontal = true
+
+	// Custom flags entry — only enabled when Custom is selected
+	customEntry := widget.NewEntry()
+	customEntry.SetPlaceHolder("flags...")
+	customEntry.Disable()
+	customEntryContainer := container.New(
+		layout.NewGridWrapLayout(fyne.NewSize(130, 30)),
+		customEntry,
+	)
+
+	operationRadio.OnChanged = func(val string) {
+		if val == "Custom" {
+			customEntry.Enable()
+		} else {
+			customEntry.Disable()
+		}
+	}
+
+	toggleRow := container.New(&compactHBox{}, searchToggle, separator, operationRadio, customEntryContainer)
+
+	leftSection := container.NewVBox(searchEntry, toggleRow)
+	toolbar := container.NewBorder(nil, nil, nil, container.NewHBox(gap, buttonStack), leftSection)
 
 	// Package list (center top)
 	packageNames := []string{}
@@ -129,12 +210,11 @@ func StartUI() {
 	lowerSection.SetOffset(0.4)
 
 	// Right section: toolbar on top, lower section below
-	rightSection := container.NewVSplit(toolbar, lowerSection)
-	rightSection.SetOffset(0.2)
+	rightSection := container.NewBorder(toolbar, nil, nil, nil, lowerSection)
 
 	// Main layout: tree on left, right section on right
 	main := container.NewHSplit(tree, rightSection)
-	main.SetOffset(0.19)
+	main.SetOffset(0.12)
 
 	w.SetContent(main)
 	w.ShowAndRun()
