@@ -4,6 +4,7 @@ package portage
 
 import (
 	"os"
+	"strings"
 
 	"github.com/Brainbeer/gensyn/models"
 )
@@ -76,6 +77,43 @@ func GetInstalledVersion(category, pkg string) string {
 		name := entry.Name()
 		if len(name) > len(pkg) && name[:len(pkg)] == pkg && name[len(pkg)] == '-' {
 			return name
+		}
+	}
+
+	return ""
+}
+
+// GetDescription parses the DESCRIPTION= field from the first .ebuild in the package directory.
+// Returns an empty string if not found or on any error.
+
+func GetDescription(category, pkg string) string {
+	dir := "/var/db/repos/gentoo/" + category + "/" + pkg
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+
+	var ebuildPath string
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".ebuild") {
+			ebuildPath = dir + "/" + entry.Name()
+			break
+		}
+	}
+	if ebuildPath == "" {
+		return ""
+	}
+
+	data, err := os.ReadFile(ebuildPath)
+	if err != nil {
+		return ""
+	}
+
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "DESCRIPTION=") {
+			val := strings.TrimPrefix(line, "DESCRIPTION=")
+			val = strings.Trim(val, `"'`)
+			return val
 		}
 	}
 
