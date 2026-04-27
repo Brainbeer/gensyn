@@ -75,6 +75,35 @@ go build -o gensyn .
 sudo cp gensyn /usr/local/bin/
 ```
 
+### Installing via Portage (recommended for Gentoo)
+
+Set up a local overlay if you don't already have one:
+
+```bash
+sudo mkdir -p /var/db/repos/localrepo/app-portage/gensyn
+sudo mkdir -p /var/db/repos/localrepo/metadata
+sudo mkdir -p /var/db/repos/localrepo/profiles
+echo 'localrepo' | sudo tee /var/db/repos/localrepo/profiles/repo_name
+echo 'masters = gentoo' | sudo tee /var/db/repos/localrepo/metadata/layout.conf
+```
+
+Register the overlay with Portage by creating `/etc/portage/repos.conf/localrepo.conf`:
+
+```ini
+[localrepo]
+location = /var/db/repos/localrepo
+sync-type = rsync
+auto-sync = no
+```
+
+Download the ebuild from the [releases page](https://github.com/Brainbeer/gensyn/releases) and install:
+
+```bash
+sudo cp gensyn-1.0.0.ebuild /var/db/repos/localrepo/app-portage/gensyn/
+sudo ebuild /var/db/repos/localrepo/app-portage/gensyn/gensyn-1.0.0.ebuild manifest
+sudo emerge app-portage/gensyn
+```
+
 ---
 
 ## Usage
