@@ -4,9 +4,11 @@ package ui
 
 import (
 	"bufio"
+	"fmt"
 	"image/color"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -80,8 +82,21 @@ func stripVersion(pkgWithVersion string) string {
 	return strings.Join(parts[:end], "-")
 }
 
+// operationOptions is the single source of truth for the emerge flag radio buttons.
+// It is used both in the toolbar and in the Preferences dialog.
+var operationOptions = []string{
+	"No Flag",
+	"-p (pretend)",
+	"-f (fetch)",
+	"-uvNDU (Update)",
+	"-C (Uninstall)",
+	"--depclean",
+	"Custom",
+}
+
 // runCommand streams the output of cmd line by line into the output widget and auto-scrolls.
-func runCommand(cmd *exec.Cmd, output *widget.RichText, scroll *container.Scroll, syncButton, installButton *widget.Button) {
+// onSuccess is called (on the main thread) when the command exits without error; may be nil.
+func runCommand(cmd *exec.Cmd, output *widget.RichText, scroll *container.Scroll, syncButton, installButton *widget.Button, onSuccess func()) {
 	pipe, err := cmd.StderrPipe()
 	if err != nil {
 		fyne.Do(func() {
@@ -141,6 +156,9 @@ func runCommand(cmd *exec.Cmd, output *widget.RichText, scroll *container.Scroll
 				output.Segments = append(output.Segments, &widget.TextSegment{Text: "\n[exited with error: " + err.Error() + "]\n"})
 			} else {
 				output.Segments = append(output.Segments, &widget.TextSegment{Text: "\n[done]\n"})
+				if onSuccess != nil {
+					onSuccess()
+				}
 			}
 			output.Refresh()
 			scroll.ScrollToBottom()
@@ -151,15 +169,18 @@ func runCommand(cmd *exec.Cmd, output *widget.RichText, scroll *container.Scroll
 }
 
 // promptAndRun shows a sudo password dialog if needed, then fires runCommand.
-func promptAndRun(args []string, needsSudo bool, output *widget.RichText, scroll *container.Scroll, syncButton, installButton *widget.Button, w fyne.Window) {
+// onSuccess is passed through to runCommand; may be nil.
+func promptAndRun(args []string, needsSudo bool, output *widget.RichText, scroll *container.Scroll, syncButton, installButton *widget.Button, w fyne.Window, onSuccess func()) {
 	syncButton.Disable()
 	installButton.Disable()
-	output.Segments = []widget.RichTextSegment{}
-	output.Refresh()
+	if Current.ClearOutput {
+		output.Segments = []widget.RichTextSegment{}
+		output.Refresh()
+	}
 
 	if !needsSudo {
 		cmd := exec.Command(args[0], args[1:]...)
-		runCommand(cmd, output, scroll, syncButton, installButton)
+		runCommand(cmd, output, scroll, syncButton, installButton, onSuccess)
 		return
 	}
 
@@ -194,7 +215,7 @@ func promptAndRun(args []string, needsSudo bool, output *widget.RichText, scroll
 			defer stdin.Close()
 			stdin.Write([]byte(password + "\n"))
 		}()
-		runCommand(cmd, output, scroll, syncButton, installButton)
+		runCommand(cmd, output, scroll, syncButton, installButton, onSuccess)
 	}
 
 	cancel := func() {
@@ -220,23 +241,235 @@ func promptAndRun(args []string, needsSudo bool, output *widget.RichText, scroll
 	d.Show()
 }
 
+// commitToPortage appends entryText to /etc/portage/<dir>/<pkgname> via sudo tee -a.
+// The package name is parsed from the atom at the start of entryText (the part after "/").
+func commitToPortage(entryText, dir string, output *widget.RichText, scroll *container.Scroll, commitButton *widget.Button, w fyne.Window) {
+	entryText = strings.TrimSpace(entryText)
+	if entryText == "" {
+		dialog.ShowInformation("Empty entry", "Please enter a package atom.", w)
+		return
+	}
+
+	fields := strings.Fields(entryText)
+	atom := fields[0]
+	parts := strings.SplitN(atom, "/", 2)
+	if len(parts) != 2 || parts[1] == "" {
+		dialog.ShowInformation("Invalid atom", "Entry must begin with category/package.", w)
+		return
+	}
+	pkgName := parts[1]
+	targetPath := "/etc/portage/" + dir + "/" + pkgName
+
+	sudoPath, err := exec.LookPath("sudo")
+	if err != nil {
+		output.Segments = append(output.Segments, &widget.TextSegment{Text: "sudo not found. Have you installed app-admin/sudo?\n"})
+		output.Refresh()
+		return
+	}
+
+	commitButton.Disable()
+	if Current.ClearOutput {
+		output.Segments = []widget.RichTextSegment{}
+		output.Refresh()
+	}
+
+	passwordEntry := widget.NewPasswordEntry()
+	passwordEntry.SetPlaceHolder("sudo password...")
+
+	var d dialog.Dialog
+
+	confirm := func() {
+		d.Hide()
+		password := passwordEntry.Text
+
+		cmd := exec.Command(sudoPath, "-S", "--", "tee", "-a", targetPath)
+
+		stdin, err := cmd.StdinPipe()
+		if err != nil {
+			fyne.Do(func() {
+				output.Segments = append(output.Segments, &widget.TextSegment{Text: "Error: " + err.Error() + "\n"})
+				output.Refresh()
+				commitButton.Enable()
+			})
+			return
+		}
+
+		stderrPipe, err := cmd.StderrPipe()
+		if err != nil {
+			fyne.Do(func() {
+				output.Segments = append(output.Segments, &widget.TextSegment{Text: "Error: " + err.Error() + "\n"})
+				output.Refresh()
+				commitButton.Enable()
+			})
+			return
+		}
+
+		stdoutPipe, err := cmd.StdoutPipe()
+		if err != nil {
+			fyne.Do(func() {
+				output.Segments = append(output.Segments, &widget.TextSegment{Text: "Error: " + err.Error() + "\n"})
+				output.Refresh()
+				commitButton.Enable()
+			})
+			return
+		}
+
+		if err := cmd.Start(); err != nil {
+			fyne.Do(func() {
+				output.Segments = append(output.Segments, &widget.TextSegment{Text: "Error starting command: " + err.Error() + "\n"})
+				output.Refresh()
+				commitButton.Enable()
+			})
+			return
+		}
+
+		// Write sudo password then entry text to stdin.
+		// sudo -S reads the password line first; tee reads the rest.
+		go func() {
+			defer stdin.Close()
+			stdin.Write([]byte(password + "\n"))
+			stdin.Write([]byte(entryText + "\n"))
+		}()
+
+		go func() {
+			scanner := bufio.NewScanner(stdoutPipe)
+			for scanner.Scan() {
+				line := stripANSI(scanner.Text())
+				fyne.Do(func() {
+					output.Segments = append(output.Segments, &widget.TextSegment{Text: line + "\n"})
+					output.Refresh()
+					scroll.ScrollToBottom()
+				})
+			}
+		}()
+
+		go func() {
+			scanner := bufio.NewScanner(stderrPipe)
+			for scanner.Scan() {
+				line := stripANSI(scanner.Text())
+				fyne.Do(func() {
+					output.Segments = append(output.Segments, &widget.TextSegment{Text: line + "\n"})
+					output.Refresh()
+					scroll.ScrollToBottom()
+				})
+			}
+		}()
+
+		go func() {
+			err := cmd.Wait()
+			fyne.Do(func() {
+				if err != nil {
+					output.Segments = append(output.Segments, &widget.TextSegment{Text: "\n[exited with error: " + err.Error() + "]\n"})
+				} else {
+					output.Segments = append(output.Segments, &widget.TextSegment{Text: "\n[written to " + targetPath + "]\n"})
+				}
+				output.Refresh()
+				scroll.ScrollToBottom()
+				commitButton.Enable()
+			})
+		}()
+	}
+
+	cancel := func() {
+		commitButton.Enable()
+	}
+
+	passwordEntry.OnSubmitted = func(_ string) {
+		confirm()
+	}
+
+	d = dialog.NewCustomConfirm("sudo password required", "Commit", "Cancel",
+		passwordEntry,
+		func(confirmed bool) {
+			if confirmed {
+				confirm()
+			} else {
+				cancel()
+			}
+		},
+		w,
+	)
+	d.Show()
+}
+
 func StartUI() {
 	a := app.New()
+	Current = LoadPrefs()
+	ApplyTheme(a, Current)
+
 	a.SetIcon(resourceIconPng)
 	w := a.NewWindow("gensyn")
 	w.Resize(fyne.NewSize(1920, 1080))
+
+	// installedCache tracks which packages have been checked for installation status.
+	// Key: "category/package". cacheChecked records whether we've looked it up yet;
+	// installedCache holds the version string (empty = not installed).
+	installedCache := map[string]string{}
+	cacheChecked := map[string]bool{}
+
+	// operationRadio, tree, and packageList are declared here so the Preferences
+	// closure (built before they are assigned) can reference them via pointer.
+	var operationRadio *widget.RadioGroup
+	var tree *widget.Tree
+	var packageList *widget.List
 
 	fileMenu := fyne.NewMenu("File",
 		fyne.NewMenuItem("Quit", func() { a.Quit() }),
 	)
 	editMenu := fyne.NewMenu("Edit",
 		fyne.NewMenuItem("Preferences", func() {
-			dialog.ShowInformation("Preferences", "Preferences coming soon.", w)
+			themeRadio := widget.NewRadioGroup([]string{"Dark", "Light"}, nil)
+			themeSelected := "Dark"
+			if Current.Theme == "light" {
+				themeSelected = "Light"
+			}
+			themeRadio.SetSelected(themeSelected)
+			themeRadio.Horizontal = true
+
+			fontSelect := widget.NewSelect([]string{"9", "10", "11", "12", "13", "14"}, nil)
+			fontSelect.SetSelected(fmt.Sprintf("%.0f", Current.FontSize))
+
+			opSelect := widget.NewSelect(operationOptions, nil)
+			opSelect.SetSelected(Current.DefaultOperation)
+
+			clearCheck := widget.NewCheck("", nil)
+			clearCheck.SetChecked(Current.ClearOutput)
+
+			form := widget.NewForm(
+				widget.NewFormItem("Theme", themeRadio),
+				widget.NewFormItem("Font size", fontSelect),
+				widget.NewFormItem("Default operation", opSelect),
+				widget.NewFormItem("Clear output on new command", clearCheck),
+			)
+
+			dialog.NewCustomConfirm("Preferences", "Save", "Cancel", form,
+				func(confirmed bool) {
+					if !confirmed {
+						return
+					}
+					newPrefs := Current
+					if themeRadio.Selected == "Light" {
+						newPrefs.Theme = "light"
+					} else {
+						newPrefs.Theme = "dark"
+					}
+					size, _ := strconv.ParseFloat(fontSelect.Selected, 32)
+					newPrefs.FontSize = float32(size)
+					newPrefs.DefaultOperation = opSelect.Selected
+					newPrefs.ClearOutput = clearCheck.Checked
+					Current = newPrefs
+					_ = SavePrefs(Current)
+					ApplyTheme(a, Current)
+					operationRadio.SetSelected(Current.DefaultOperation)
+					tree.Refresh()
+					packageList.Refresh()
+				}, w).Show()
 		}),
 	)
 	aboutMenu := fyne.NewMenu("About",
 		fyne.NewMenuItem("About gensyn", func() {
-			dialog.ShowInformation("About", "gensyn\nA Synaptic-like package manager for Gentoo.", w)
+			dialog.ShowInformation("About gensyn",
+				"Gensyn - A Synaptic-like program for Gentoo\n\nVersion 1.0\nJarrod McCandless\n\nLicense: GPL 3\nhttps://github.com/Brainbeer/gensyn", w)
 		}),
 	)
 	w.SetMainMenu(fyne.NewMainMenu(fileMenu, editMenu, aboutMenu))
@@ -259,22 +492,22 @@ func StartUI() {
 	outputScroll := container.NewVScroll(output)
 
 	packageNames := []string{}
-	packageList := widget.NewList(
+	packageList = widget.NewList(
 		func() int { return len(packageNames) },
 		func() fyne.CanvasObject {
 			t := canvas.NewText("", nil)
-			t.TextSize = 11
+			t.TextSize = Current.FontSize
 			return t
 		},
 		func(id widget.ListItemID, o fyne.CanvasObject) {
-			o.(*canvas.Text).Text = packageNames[id]
-			o.Refresh()
+			t := o.(*canvas.Text)
+			t.Text = packageNames[id]
+			t.TextSize = Current.FontSize
+			t.Refresh()
 		},
 	)
 
 	selectedUID := ""
-
-	var tree *widget.Tree
 
 	selectInTree := func(uid string) {
 		parts := strings.SplitN(uid, "/", 2)
@@ -284,6 +517,14 @@ func StartUI() {
 		tree.OpenBranch(parts[0])
 		tree.Select(uid)
 		tree.ScrollTo(uid)
+	}
+
+	// clearInstalledCache wipes the cache and refreshes the tree so installed
+	// status is re-checked on the next render of each visible node.
+	clearInstalledCache := func() {
+		installedCache = map[string]string{}
+		cacheChecked = map[string]bool{}
+		tree.Refresh()
 	}
 
 	tree = widget.NewTree(
@@ -305,20 +546,32 @@ func StartUI() {
 			return !strings.Contains(uid, "/")
 		},
 		func(branch bool) fyne.CanvasObject {
-			if branch {
-				return widget.NewLabel("")
-			}
-			t := canvas.NewText("", nil)
-			t.TextSize = 11
-			return t
+			// Both branches and leaves use widget.Label so we can set TextStyle.Bold.
+			return widget.NewLabel("")
 		},
 		func(uid string, branch bool, o fyne.CanvasObject) {
+			lbl := o.(*widget.Label)
 			if branch {
-				o.(*widget.Label).SetText(uid)
+				lbl.TextStyle = fyne.TextStyle{}
+				lbl.SetText(uid)
+				return
+			}
+
+			parts := strings.SplitN(uid, "/", 2)
+			category, pkg := parts[0], parts[1]
+
+			// Check cache; call GetInstalledVersion only on first encounter.
+			if !cacheChecked[uid] {
+				cacheChecked[uid] = true
+				installedCache[uid] = portage.GetInstalledVersion(category, pkg)
+			}
+
+			if installedCache[uid] != "" {
+				lbl.TextStyle = fyne.TextStyle{Bold: true}
+				lbl.SetText("✓ " + pkg)
 			} else {
-				parts := strings.SplitN(uid, "/", 2)
-				o.(*canvas.Text).Text = parts[1]
-				o.Refresh()
+				lbl.TextStyle = fyne.TextStyle{}
+				lbl.SetText(pkg)
 			}
 		},
 	)
@@ -382,8 +635,8 @@ func StartUI() {
 
 	separator := widget.NewLabel("|")
 
-	operationRadio := widget.NewRadioGroup([]string{"No Flag", "-p (pretend)", "-f (fetch)", "-uvNDU (Update)", "Custom"}, nil)
-	operationRadio.SetSelected("No Flag")
+	operationRadio = widget.NewRadioGroup(operationOptions, nil)
+	operationRadio.SetSelected(Current.DefaultOperation)
 	operationRadio.Horizontal = true
 
 	customEntry := widget.NewEntry()
@@ -525,45 +778,89 @@ func StartUI() {
 	toolbar := container.NewBorder(nil, nil, nil, container.NewHBox(gap, buttonStack), leftSection)
 
 	syncButton.OnTapped = func() {
-		promptAndRun([]string{"emerge", "--sync"}, true, output, outputScroll, syncButton, installButton, w)
+		// Sync does not change installed packages so no cache clear needed.
+		promptAndRun([]string{"emerge", "--sync"}, true, output, outputScroll, syncButton, installButton, w, nil)
 	}
 
 	installButton.OnTapped = func() {
 		op := operationRadio.Selected
 
-		if op == "-uvNDU (Update)" {
-			promptAndRun([]string{"emerge", "-uvNDU", "world"}, true, output, outputScroll, syncButton, installButton, w)
-			return
-		}
-
-		if selectedUID == "" {
-			dialog.ShowInformation("No package selected", "Please select a package from the tree first.", w)
-			return
-		}
-
-		needsSudo := op != "-p (pretend)"
-
-		var flags []string
 		switch op {
-		case "No Flag":
-			flags = []string{}
+
+		case "-uvNDU (Update)":
+			promptAndRun([]string{"emerge", "-uvNDU", "world"}, true, output, outputScroll, syncButton, installButton, w, clearInstalledCache)
+
+		case "--depclean":
+			promptAndRun([]string{"emerge", "--depclean"}, true, output, outputScroll, syncButton, installButton, w, clearInstalledCache)
+
+		case "-C (Uninstall)":
+			if selectedUID == "" {
+				dialog.ShowInformation("No package selected", "Please select a package from the tree first.", w)
+				return
+			}
+			promptAndRun([]string{"emerge", "-C", selectedUID}, true, output, outputScroll, syncButton, installButton, w, clearInstalledCache)
+
 		case "-p (pretend)":
-			flags = []string{"-p"}
+			if selectedUID == "" {
+				dialog.ShowInformation("No package selected", "Please select a package from the tree first.", w)
+				return
+			}
+			promptAndRun([]string{"emerge", "-p", selectedUID}, false, output, outputScroll, syncButton, installButton, w, nil)
+
 		case "-f (fetch)":
-			flags = []string{"-f"}
+			if selectedUID == "" {
+				dialog.ShowInformation("No package selected", "Please select a package from the tree first.", w)
+				return
+			}
+			promptAndRun([]string{"emerge", "-f", selectedUID}, true, output, outputScroll, syncButton, installButton, w, nil)
+
 		case "Custom":
+			if selectedUID == "" {
+				dialog.ShowInformation("No package selected", "Please select a package from the tree first.", w)
+				return
+			}
 			raw := strings.TrimSpace(customEntry.Text)
 			if raw == "" {
 				dialog.ShowInformation("No flags", "Please enter custom flags or select a different mode.", w)
 				return
 			}
-			flags = strings.Fields(raw)
-		}
+			args := append([]string{"emerge"}, strings.Fields(raw)...)
+			args = append(args, selectedUID)
+			promptAndRun(args, true, output, outputScroll, syncButton, installButton, w, nil)
 
-		args := append([]string{"emerge"}, flags...)
-		args = append(args, selectedUID)
-		promptAndRun(args, needsSudo, output, outputScroll, syncButton, installButton, w)
+		default: // "No Flag"
+			if selectedUID == "" {
+				dialog.ShowInformation("No package selected", "Please select a package from the tree first.", w)
+				return
+			}
+			promptAndRun([]string{"emerge", selectedUID}, true, output, outputScroll, syncButton, installButton, w, clearInstalledCache)
+		}
 	}
+
+	// Bottom toolbar: portage config writer
+	portageRadio := widget.NewRadioGroup([]string{"package.mask", "package.accept_keywords", "package.use"}, nil)
+	portageRadio.SetSelected("package.use")
+	portageRadio.Horizontal = true
+
+	portageEntry := widget.NewEntry()
+	portageEntry.SetPlaceHolder("category/package [flags]")
+
+	commitButton := widget.NewButton("Commit", nil)
+	commitButton.OnTapped = func() {
+		dir := portageRadio.Selected
+		if dir == "" {
+			dialog.ShowInformation("No target selected", "Please select package.mask, package.accept_keywords, or package.use.", w)
+			return
+		}
+		commitToPortage(portageEntry.Text, dir, output, outputScroll, commitButton, w)
+	}
+
+	commitButtonContainer := container.New(
+		layout.NewGridWrapLayout(fyne.NewSize(80, 30)),
+		commitButton,
+	)
+
+	bottomToolbar := container.NewBorder(nil, nil, portageRadio, commitButtonContainer, portageEntry)
 
 	centerSection := container.NewVSplit(packageList, descriptionScroll)
 	centerSection.SetOffset(0.6)
@@ -576,6 +873,8 @@ func StartUI() {
 	main := container.NewHSplit(tree, rightSection)
 	main.SetOffset(0.12)
 
-	w.SetContent(main)
+	root := container.NewBorder(nil, bottomToolbar, nil, nil, main)
+
+	w.SetContent(root)
 	w.ShowAndRun()
 }
