@@ -18,6 +18,8 @@ type Prefs struct {
 	FontSize         float32 `json:"font_size"`         // 9–14
 	DefaultOperation string  `json:"default_operation"` // emerge flag preset
 	ClearOutput      bool    `json:"clear_output"`      // clear terminal on new command
+	Editor           string  `json:"editor"`            // editor key, or "" for none
+	CustomEditor     string  `json:"custom_editor"`     // path used when Editor == "custom"
 }
 
 // Current holds the active preferences for the running session.
@@ -29,6 +31,8 @@ func defaultPrefs() Prefs {
 		FontSize:         11,
 		DefaultOperation: "No Flag",
 		ClearOutput:      true,
+		Editor:           "",
+		CustomEditor:     "",
 	}
 }
 
@@ -71,6 +75,29 @@ func SavePrefs(p Prefs) error {
 		return err
 	}
 	return os.WriteFile(path, data, 0644)
+}
+
+// editorMap maps the stored key to the executable name.
+var editorMap = map[string]string{
+	"mousepad":   "mousepad",
+	"pluma":      "pluma",
+	"kwrite":     "kwrite",
+	"kate":       "kate",
+	"gedit":      "gedit",
+	"geany":      "geany",
+	"xed":        "xed",
+	"featherpad": "featherpad",
+	"subl":       "subl",
+	"code":       "code",
+	"atom":       "atom",
+}
+
+// EditorExecutable returns the executable to launch for editing, or "" if none is set.
+func EditorExecutable() string {
+	if Current.Editor == "custom" {
+		return Current.CustomEditor
+	}
+	return editorMap[Current.Editor]
 }
 
 // forcedTheme wraps the default Fyne theme, overriding color variant and text size.

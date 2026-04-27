@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"fmt"
 	"image/color"
+	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
@@ -83,7 +84,6 @@ func stripVersion(pkgWithVersion string) string {
 }
 
 // operationOptions is the single source of truth for the emerge flag radio buttons.
-// It is used both in the toolbar and in the Preferences dialog.
 var operationOptions = []string{
 	"No Flag",
 	"-p (pretend)",
@@ -92,6 +92,206 @@ var operationOptions = []string{
 	"-C (Uninstall)",
 	"--depclean",
 	"Custom",
+}
+
+// editorOptions are the friendly names shown in the Preferences select widget.
+// The order here matches editorSelectToKey / editorKeyToSelect.
+var editorOptions = []string{
+	"(none)",
+	"Mousepad",
+	"Pluma",
+	"Kwrite",
+	"Kate",
+	"Gedit",
+	"Geany",
+	"Xed",
+	"Featherpad",
+	"Sublime Text",
+	"VSCode",
+	"Atom",
+	"Custom",
+}
+
+// editorSelectToKey converts a friendly display name to the value stored in Prefs.Editor.
+func editorSelectToKey(sel string) string {
+	switch sel {
+	case "Mousepad":
+		return "mousepad"
+	case "Pluma":
+		return "pluma"
+	case "Kwrite":
+		return "kwrite"
+	case "Kate":
+		return "kate"
+	case "Gedit":
+		return "gedit"
+	case "Geany":
+		return "geany"
+	case "Xed":
+		return "xed"
+	case "Featherpad":
+		return "featherpad"
+	case "Sublime Text":
+		return "subl"
+	case "VSCode":
+		return "code"
+	case "Atom":
+		return "atom"
+	case "Custom":
+		return "custom"
+	default:
+		return ""
+	}
+}
+
+// editorKeyToSelect converts a Prefs.Editor value back to the display name.
+func editorKeyToSelect(key string) string {
+	switch key {
+	case "mousepad":
+		return "Mousepad"
+	case "pluma":
+		return "Pluma"
+	case "kwrite":
+		return "Kwrite"
+	case "kate":
+		return "Kate"
+	case "gedit":
+		return "Gedit"
+	case "geany":
+		return "Geany"
+	case "xed":
+		return "Xed"
+	case "featherpad":
+		return "Featherpad"
+	case "subl":
+		return "Sublime Text"
+	case "code":
+		return "VSCode"
+	case "atom":
+		return "Atom"
+	case "custom":
+		return "Custom"
+	default:
+		return "(none)"
+	}
+}
+
+// openPortageDir opens a dialog listing all files in /etc/portage/<dir>.
+// Selecting a file offers View or Edit actions.
+func openPortageDir(dir string, w fyne.Window) {
+	basePath := "/etc/portage/" + dir
+	entries, err := os.ReadDir(basePath)
+	if err != nil {
+		dialog.ShowInformation("Error", "Could not read "+basePath+":\n"+err.Error(), w)
+		return
+	}
+
+	var files []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			files = append(files, e.Name())
+		}
+	}
+
+	if len(files) == 0 {
+		dialog.ShowInformation(dir, "No files found in "+basePath+".", w)
+		return
+	}
+
+	var listDialog dialog.Dialog
+
+	list := widget.NewList(
+		func() int { return len(files) },
+		func() fyne.CanvasObject { return widget.NewLabel("") },
+		func(id widget.ListItemID, o fyne.CanvasObject) {
+			o.(*widget.Label).SetText(files[id])
+		},
+	)
+
+	list.OnSelected = func(id widget.ListItemID) {
+		listDialog.Hide()
+		filename := files[id]
+		fullPath := basePath + "/" + filename
+
+		viewButton := widget.NewButton("View", func() {})
+		editButton := widget.NewButton("Edit", func() {})
+		var choiceDialog dialog.Dialog
+
+		viewButton.OnTapped = func() {
+			choiceDialog.Hide()
+			data, err := os.ReadFile(fullPath)
+			if err != nil {
+				dialog.ShowInformation("Error", "Could not read "+fullPath+":\n"+err.Error(), w)
+				return
+			}
+			content := widget.NewRichText(&widget.TextSegment{Text: string(data)})
+			content.Wrapping = fyne.TextWrapWord
+			scroll := container.NewVScroll(content)
+			scroll.SetMinSize(fyne.NewSize(600, 400))
+			d := dialog.NewCustom(filename, "Close", scroll, w)
+			d.Show()
+		}
+
+		editButton.OnTapped = func() {
+			choiceDialog.Hide()
+			exe := EditorExecutable()
+			if exe == "" {
+				dialog.ShowInformation("No editor set",
+					"Please choose a text editor in Edit → Preferences.", w)
+				return
+			}
+
+			sudoPath, err := exec.LookPath("sudo")
+			if err != nil {
+				dialog.ShowInformation("sudo not found",
+					"sudo not found. Have you installed app-admin/sudo?", w)
+				return
+			}
+
+			passwordEntry := widget.NewPasswordEntry()
+			passwordEntry.SetPlaceHolder("sudo password...")
+
+			var sudoDialog dialog.Dialog
+
+			launch := func() {
+				sudoDialog.Hide()
+				password := passwordEntry.Text
+				cmd := exec.Command(sudoPath, "-S", "--", exe, fullPath)
+				stdin, err := cmd.StdinPipe()
+				if err != nil {
+					dialog.ShowInformation("Error", err.Error(), w)
+					return
+				}
+				go func() {
+					defer stdin.Close()
+					stdin.Write([]byte(password + "\n"))
+				}()
+				cmd.Start()
+			}
+
+			passwordEntry.OnSubmitted = func(_ string) { launch() }
+
+			sudoDialog = dialog.NewCustomConfirm("sudo password required", "Open", "Cancel",
+				passwordEntry,
+				func(confirmed bool) {
+					if confirmed {
+						launch()
+					}
+				},
+				w,
+			)
+			sudoDialog.Show()
+		}
+
+		buttons := container.NewHBox(viewButton, editButton)
+		choiceDialog = dialog.NewCustom("Open "+filename, "Cancel", buttons, w)
+		choiceDialog.Show()
+	}
+
+	listContainer := container.NewVScroll(list)
+	listContainer.SetMinSize(fyne.NewSize(400, 400))
+	listDialog = dialog.NewCustom(dir, "Close", listContainer, w)
+	listDialog.Show()
 }
 
 // runCommand streams the output of cmd line by line into the output widget and auto-scrolls.
@@ -242,7 +442,6 @@ func promptAndRun(args []string, needsSudo bool, output *widget.RichText, scroll
 }
 
 // commitToPortage appends entryText to /etc/portage/<dir>/<pkgname> via sudo tee -a.
-// The package name is parsed from the atom at the start of entryText (the part after "/").
 func commitToPortage(entryText, dir string, output *widget.RichText, scroll *container.Scroll, commitButton *widget.Button, w fyne.Window) {
 	entryText = strings.TrimSpace(entryText)
 	if entryText == "" {
@@ -323,8 +522,6 @@ func commitToPortage(entryText, dir string, output *widget.RichText, scroll *con
 			return
 		}
 
-		// Write sudo password then entry text to stdin.
-		// sudo -S reads the password line first; tee reads the rest.
 		go func() {
 			defer stdin.Close()
 			stdin.Write([]byte(password + "\n"))
@@ -401,14 +598,9 @@ func StartUI() {
 	w := a.NewWindow("gensyn")
 	w.Resize(fyne.NewSize(1920, 1080))
 
-	// installedCache tracks which packages have been checked for installation status.
-	// Key: "category/package". cacheChecked records whether we've looked it up yet;
-	// installedCache holds the version string (empty = not installed).
 	installedCache := map[string]string{}
 	cacheChecked := map[string]bool{}
 
-	// operationRadio, tree, and packageList are declared here so the Preferences
-	// closure (built before they are assigned) can reference them via pointer.
 	var operationRadio *widget.RadioGroup
 	var tree *widget.Tree
 	var packageList *widget.List
@@ -416,6 +608,7 @@ func StartUI() {
 	fileMenu := fyne.NewMenu("File",
 		fyne.NewMenuItem("Quit", func() { a.Quit() }),
 	)
+
 	editMenu := fyne.NewMenu("Edit",
 		fyne.NewMenuItem("Preferences", func() {
 			themeRadio := widget.NewRadioGroup([]string{"Dark", "Light"}, nil)
@@ -435,11 +628,31 @@ func StartUI() {
 			clearCheck := widget.NewCheck("", nil)
 			clearCheck.SetChecked(Current.ClearOutput)
 
+			editorSelect := widget.NewSelect(editorOptions, nil)
+			editorSelect.SetSelected(editorKeyToSelect(Current.Editor))
+
+			customEditorEntry := widget.NewEntry()
+			customEditorEntry.SetPlaceHolder("/usr/bin/myeditor")
+			customEditorEntry.SetText(Current.CustomEditor)
+			if Current.Editor != "custom" {
+				customEditorEntry.Disable()
+			}
+
+			editorSelect.OnChanged = func(val string) {
+				if val == "Custom" {
+					customEditorEntry.Enable()
+				} else {
+					customEditorEntry.Disable()
+				}
+			}
+
 			form := widget.NewForm(
 				widget.NewFormItem("Theme", themeRadio),
 				widget.NewFormItem("Font size", fontSelect),
 				widget.NewFormItem("Default operation", opSelect),
 				widget.NewFormItem("Clear output on new command", clearCheck),
+				widget.NewFormItem("Text editor", editorSelect),
+				widget.NewFormItem("Custom editor path", customEditorEntry),
 			)
 
 			dialog.NewCustomConfirm("Preferences", "Save", "Cancel", form,
@@ -457,6 +670,8 @@ func StartUI() {
 					newPrefs.FontSize = float32(size)
 					newPrefs.DefaultOperation = opSelect.Selected
 					newPrefs.ClearOutput = clearCheck.Checked
+					newPrefs.Editor = editorSelectToKey(editorSelect.Selected)
+					newPrefs.CustomEditor = strings.TrimSpace(customEditorEntry.Text)
 					Current = newPrefs
 					_ = SavePrefs(Current)
 					ApplyTheme(a, Current)
@@ -466,13 +681,27 @@ func StartUI() {
 				}, w).Show()
 		}),
 	)
+
+	viewMenu := fyne.NewMenu("View",
+		fyne.NewMenuItem("package.use", func() {
+			openPortageDir("package.use", w)
+		}),
+		fyne.NewMenuItem("package.mask", func() {
+			openPortageDir("package.mask", w)
+		}),
+		fyne.NewMenuItem("package.accept_keywords", func() {
+			openPortageDir("package.accept_keywords", w)
+		}),
+	)
+
 	aboutMenu := fyne.NewMenu("About",
 		fyne.NewMenuItem("About gensyn", func() {
 			dialog.ShowInformation("About gensyn",
 				"Gensyn - A Synaptic-like program for Gentoo\n\nVersion 1.0\nJarrod McCandless\n\nLicense: GPL 3\nhttps://github.com/Brainbeer/gensyn", w)
 		}),
 	)
-	w.SetMainMenu(fyne.NewMainMenu(fileMenu, editMenu, aboutMenu))
+
+	w.SetMainMenu(fyne.NewMainMenu(fileMenu, editMenu, viewMenu, aboutMenu))
 
 	categories, err := portage.GetCategories()
 	if err != nil {
@@ -519,8 +748,6 @@ func StartUI() {
 		tree.ScrollTo(uid)
 	}
 
-	// clearInstalledCache wipes the cache and refreshes the tree so installed
-	// status is re-checked on the next render of each visible node.
 	clearInstalledCache := func() {
 		installedCache = map[string]string{}
 		cacheChecked = map[string]bool{}
@@ -546,7 +773,6 @@ func StartUI() {
 			return !strings.Contains(uid, "/")
 		},
 		func(branch bool) fyne.CanvasObject {
-			// Both branches and leaves use widget.Label so we can set TextStyle.Bold.
 			return widget.NewLabel("")
 		},
 		func(uid string, branch bool, o fyne.CanvasObject) {
@@ -560,7 +786,6 @@ func StartUI() {
 			parts := strings.SplitN(uid, "/", 2)
 			category, pkg := parts[0], parts[1]
 
-			// Check cache; call GetInstalledVersion only on first encounter.
 			if !cacheChecked[uid] {
 				cacheChecked[uid] = true
 				installedCache[uid] = portage.GetInstalledVersion(category, pkg)
@@ -778,7 +1003,6 @@ func StartUI() {
 	toolbar := container.NewBorder(nil, nil, nil, container.NewHBox(gap, buttonStack), leftSection)
 
 	syncButton.OnTapped = func() {
-		// Sync does not change installed packages so no cache clear needed.
 		promptAndRun([]string{"emerge", "--sync"}, true, output, outputScroll, syncButton, installButton, w, nil)
 	}
 
