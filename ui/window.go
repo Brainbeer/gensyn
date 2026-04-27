@@ -294,6 +294,83 @@ func openPortageDir(dir string, w fyne.Window) {
 	listDialog.Show()
 }
 
+// openSinglePortageFile shows a View/Edit dialog for a single known file path.
+func openSinglePortageFile(fullPath, name string, w fyne.Window) {
+	viewButton := widget.NewButton("View", func() {})
+	editButton := widget.NewButton("Edit", func() {})
+	var choiceDialog dialog.Dialog
+
+	viewButton.OnTapped = func() {
+		choiceDialog.Hide()
+		data, err := os.ReadFile(fullPath)
+		if err != nil {
+			dialog.ShowInformation("Error", "Could not read "+fullPath+":\n"+err.Error(), w)
+			return
+		}
+		content := widget.NewRichText(&widget.TextSegment{Text: string(data)})
+		content.Wrapping = fyne.TextWrapWord
+		scroll := container.NewVScroll(content)
+		scroll.SetMinSize(fyne.NewSize(600, 400))
+		d := dialog.NewCustom(name, "Close", scroll, w)
+		d.Show()
+	}
+
+	editButton.OnTapped = func() {
+		choiceDialog.Hide()
+		exe := EditorExecutable()
+		if exe == "" {
+			dialog.ShowInformation("No editor set",
+				"Please choose a text editor in Edit → Preferences.", w)
+			return
+		}
+
+		sudoPath, err := exec.LookPath("sudo")
+		if err != nil {
+			dialog.ShowInformation("sudo not found",
+				"sudo not found. Have you installed app-admin/sudo?", w)
+			return
+		}
+
+		passwordEntry := widget.NewPasswordEntry()
+		passwordEntry.SetPlaceHolder("sudo password...")
+
+		var sudoDialog dialog.Dialog
+
+		launch := func() {
+			sudoDialog.Hide()
+			password := passwordEntry.Text
+			cmd := exec.Command(sudoPath, "-S", "--", exe, fullPath)
+			stdin, err := cmd.StdinPipe()
+			if err != nil {
+				dialog.ShowInformation("Error", err.Error(), w)
+				return
+			}
+			go func() {
+				defer stdin.Close()
+				stdin.Write([]byte(password + "\n"))
+			}()
+			cmd.Start()
+		}
+
+		passwordEntry.OnSubmitted = func(_ string) { launch() }
+
+		sudoDialog = dialog.NewCustomConfirm("sudo password required", "Open", "Cancel",
+			passwordEntry,
+			func(confirmed bool) {
+				if confirmed {
+					launch()
+				}
+			},
+			w,
+		)
+		sudoDialog.Show()
+	}
+
+	buttons := container.NewHBox(viewButton, editButton)
+	choiceDialog = dialog.NewCustom("Open "+name, "Cancel", buttons, w)
+	choiceDialog.Show()
+}
+
 // runCommand streams the output of cmd line by line into the output widget and auto-scrolls.
 // onSuccess is called (on the main thread) when the command exits without error; may be nil.
 func runCommand(cmd *exec.Cmd, output *widget.RichText, scroll *container.Scroll, syncButton, installButton *widget.Button, onSuccess func()) {
@@ -441,7 +518,13 @@ func promptAndRun(args []string, needsSudo bool, output *widget.RichText, scroll
 	d.Show()
 }
 
-// commitToPortage appends entryText to /etc/portage/<dir>/<pkgname> via sudo tee -a.
+// singleQuote wraps s in single quotes for safe shell embedding,
+// escaping any single quotes already present in the string.
+func singleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+}
+
+// commitToPortage appends entryText to /etc/portage/<dir>/<pkgname> via sudo sh -c.
 func commitToPortage(entryText, dir string, output *widget.RichText, scroll *container.Scroll, commitButton *widget.Button, w fyne.Window) {
 	entryText = strings.TrimSpace(entryText)
 	if entryText == "" {
@@ -481,7 +564,10 @@ func commitToPortage(entryText, dir string, output *widget.RichText, scroll *con
 		d.Hide()
 		password := passwordEntry.Text
 
-		cmd := exec.Command(sudoPath, "-S", "--", "tee", "-a", targetPath)
+		// Use sudo sh -c so the password is the only thing on stdin.
+		// The entry text is baked into the shell command string — never touches stdin.
+		shCmd := "printf '%s\\n' " + singleQuote(entryText) + " >> " + singleQuote(targetPath)
+		cmd := exec.Command(sudoPath, "-S", "sh", "-c", shCmd)
 
 		stdin, err := cmd.StdinPipe()
 		if err != nil {
@@ -503,16 +589,6 @@ func commitToPortage(entryText, dir string, output *widget.RichText, scroll *con
 			return
 		}
 
-		stdoutPipe, err := cmd.StdoutPipe()
-		if err != nil {
-			fyne.Do(func() {
-				output.Segments = append(output.Segments, &widget.TextSegment{Text: "Error: " + err.Error() + "\n"})
-				output.Refresh()
-				commitButton.Enable()
-			})
-			return
-		}
-
 		if err := cmd.Start(); err != nil {
 			fyne.Do(func() {
 				output.Segments = append(output.Segments, &widget.TextSegment{Text: "Error starting command: " + err.Error() + "\n"})
@@ -522,22 +598,10 @@ func commitToPortage(entryText, dir string, output *widget.RichText, scroll *con
 			return
 		}
 
+		// Password is the only thing written to stdin.
 		go func() {
 			defer stdin.Close()
 			stdin.Write([]byte(password + "\n"))
-			stdin.Write([]byte(entryText + "\n"))
-		}()
-
-		go func() {
-			scanner := bufio.NewScanner(stdoutPipe)
-			for scanner.Scan() {
-				line := stripANSI(scanner.Text())
-				fyne.Do(func() {
-					output.Segments = append(output.Segments, &widget.TextSegment{Text: line + "\n"})
-					output.Refresh()
-					scroll.ScrollToBottom()
-				})
-			}
 		}()
 
 		go func() {
@@ -692,6 +756,29 @@ func StartUI() {
 		fyne.NewMenuItem("package.accept_keywords", func() {
 			openPortageDir("package.accept_keywords", w)
 		}),
+		fyne.NewMenuItem("make.conf", func() {
+			openSinglePortageFile("/etc/portage/make.conf", "make.conf", w)
+		}),
+	)
+
+	toolsMenu := fyne.NewMenu("Tools",
+		fyne.NewMenuItem("emerge --info", func() {
+			go func() {
+				out, err := exec.Command("emerge", "--info").Output()
+				fyne.Do(func() {
+					text := string(out)
+					if err != nil {
+						text = "Error running emerge --info:\n" + err.Error()
+					}
+					content := widget.NewRichText(&widget.TextSegment{Text: text})
+					content.Wrapping = fyne.TextWrapWord
+					scroll := container.NewVScroll(content)
+					scroll.SetMinSize(fyne.NewSize(700, 500))
+					d := dialog.NewCustom("emerge --info", "Close", scroll, w)
+					d.Show()
+				})
+			}()
+		}),
 	)
 
 	aboutMenu := fyne.NewMenu("About",
@@ -701,7 +788,7 @@ func StartUI() {
 		}),
 	)
 
-	w.SetMainMenu(fyne.NewMainMenu(fileMenu, editMenu, viewMenu, aboutMenu))
+	w.SetMainMenu(fyne.NewMainMenu(fileMenu, editMenu, viewMenu, toolsMenu, aboutMenu))
 
 	categories, err := portage.GetCategories()
 	if err != nil {
